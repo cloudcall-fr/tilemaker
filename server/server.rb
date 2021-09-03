@@ -82,7 +82,7 @@ class MapServer
 		elsif File.exist?(path)
 			# Serve static file
 			ct = path.match(/\.(\w+)$/) ? (CONTENT_TYPES[$1.to_sym] || 'text/html') : 'text/html'
-			['200', {'Content-Type' => ct, 'Cache-Control' => "max-age=#{@@max_age}"}, [File.read(path)]]
+			['200', {'Access-Control-Allow-Origin' => '*', 'Content-Type' => ct, 'Cache-Control' => "max-age=#{@@max_age}"}, [File.read(path)]]
 
 		elsif path=~/font.+\.pbf/
 			# Font not found so send dummy file
