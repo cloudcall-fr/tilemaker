@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 #include <mutex>
+#include <unordered_set>
 
 class void_mmap_allocator
 {
@@ -189,6 +190,58 @@ private:
 	std::shared_ptr<map_t> mLatpLons;
 };
 
+// list of ways used by relations
+// by noting these in advance, we don't need to store all ways in the store
+class UsedWays {
+
+private:
+	std::vector<bool> usedList;
+	mutable std::mutex mutex;
+
+public:
+	bool inited = false;
+
+	// Size the vector to a reasonable estimate, to avoid resizing on the fly
+	void reserve(bool compact, size_t numNodes) {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (inited) return;
+		inited = true;
+		if (compact) {
+			// If we're running in compact mode, way count is roughly 1/9th of node count... say 1/8 to be safe
+			usedList.reserve(numNodes/8);
+		} else {
+			// Otherwise, we could have anything up to the current max node ID (approaching 2**30 in summer 2021)
+			// 2**31 is 0.25GB with a vector<bool>
+			usedList.reserve(pow(2,31));
+		}
+	}
+	
+	// Mark a way as used
+	void insert(WayID wayid) {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (wayid>usedList.size()) usedList.resize(wayid+1);
+		usedList[wayid] = true;
+	}
+	
+	void insert_set(std::unordered_set<WayID> ids) {
+		std::lock_guard<std::mutex> lock(mutex);
+		for (WayID wayid : ids) {
+			if (wayid>usedList.size()) usedList.resize(wayid+1);
+			usedList[wayid] = true;
+		}
+	}
+	
+	// See if a way is used
+	bool at(WayID wayid) const {
+		return (wayid>usedList.size()) ? false : usedList[wayid];
+	}
+	
+	void clear() {
+		std::lock_guard<std::mutex> lock(mutex);
+		usedList.clear();
+	}
+};
+
 // way store
 class WayStore {
 
@@ -309,14 +362,14 @@ private:
 class OSMStore
 {
 public:
-	using point_store_t = std::deque<Point>;
+	using point_store_t = std::deque<std::pair<NodeID, Point>>;
 
 	using linestring_t = boost::geometry::model::linestring<Point, std::vector, mmap_allocator>;
-	using linestring_store_t = std::deque<linestring_t>;
+	using linestring_store_t = std::deque<std::pair<NodeID, linestring_t>>;
 
 	using polygon_t = boost::geometry::model::polygon<Point, true, true, std::vector, std::vector, mmap_allocator, mmap_allocator>;
 	using multi_polygon_t = boost::geometry::model::multi_polygon<polygon_t, std::vector, mmap_allocator>;
-	using multi_polygon_store_t = std::deque<multi_polygon_t>;
+	using multi_polygon_store_t = std::deque<std::pair<NodeID, multi_polygon_t>>;
 
 	struct generated {
 		std::mutex points_store_mutex;
@@ -336,6 +389,7 @@ protected:
 
 	WayStore ways;
 	RelationStore relations;
+	UsedWays used_ways;
 
 	generated osm_generated;
 	generated shp_generated;
@@ -366,6 +420,9 @@ public:
 
 	void use_compact_store(bool use = true) { use_compact_nodes = use; }
 
+	void shapes_sort(unsigned int threadNum = 1);
+	void generated_sort(unsigned int threadNum = 1);
+
 	void nodes_insert_back(NodeID i, LatpLon coord) {
 		if(!use_compact_nodes)
 			nodes.insert_back(i, coord);
@@ -378,24 +435,30 @@ public:
 		else
 			compact_nodes.insert_back(new_nodes);
 	}
-	void nodes_sort(unsigned int threadNum) {
-		if(!use_compact_nodes)
-			nodes.sort(threadNum);
+	void nodes_sort(unsigned int threadNum);
+	std::size_t nodes_size() {
+		return use_compact_nodes ? compact_nodes.size() : nodes.size();
 	}
-	
-	LatpLon nodes_at(NodeID i) const { 
+
+  LatpLon nodes_at(NodeID i) const { 
 		return use_compact_nodes ? compact_nodes.at(i) : nodes.at(i);
 	}
 
 	void ways_insert_back(std::vector<WayStore::element_t> &new_ways) {
 		ways.insert_back(new_ways);
 	}
-	void ways_sort(unsigned int threadNum) { 
-		ways.sort(threadNum); 
-	}
+	void ways_sort(unsigned int threadNum);
 
 	void relations_insert_front(std::vector<RelationStore::element_t> &new_relations) {
 		relations.insert_front(new_relations);
+	}
+	void relations_sort(unsigned int threadNum);
+
+	void mark_way_used(WayID i) { used_ways.insert(i); }
+	void mark_ways_used(std::unordered_set<WayID> ids) { used_ways.insert_set(ids); }
+	bool way_is_used(WayID i) { return used_ways.at(i); }
+	void ensure_used_ways_inited() {
+		if (!used_ways.inited) used_ways.reserve(use_compact_nodes, nodes_size());
 	}
 
 	generated &osm() { return osm_generated; }
@@ -406,50 +469,71 @@ public:
 	using handle_t = void *;
 
 	template<typename T>
-	static T const &retrieve(handle_t handle) 
-	{
-		return *reinterpret_cast<T const *>(handle);
-	}
-
-	template<typename T>
-	handle_t store_point(generated &store, T const &input) {	
+	void store_point(generated &store, NodeID id, T const &input) {	
 		std::lock_guard<std::mutex> lock(store.points_store_mutex);
-		store.points_store->push_back(input);		   	
-		return &store.points_store->back();		   	
+		store.points_store->emplace_back(id, input);		   	
 	}
 
-	Point retrieve_point(generated const &store, std::size_t id) const {
-		return store.points_store->at(id);		   
+	Point const &retrieve_point(generated const &store, NodeID id) const {
+		auto iter = std::lower_bound(store.points_store->begin(), store.points_store->end(), id, [](auto const &e, auto id) { 
+			return e.first < id; 
+		});
+
+		if(iter == store.points_store->end() || iter->first != id)
+			throw std::out_of_range("Could not find generated node with id " + std::to_string(id));
+
+		return iter->second;
 	}
 	
 	template<typename Input>
-	handle_t store_linestring(generated &store, Input const &src)
+	void store_linestring(generated &store, NodeID id, Input const &src)
 	{
 		linestring_t dst(src.begin(), src.end());
 
 		std::lock_guard<std::mutex> lock(store.linestring_store_mutex);
-		store.linestring_store->emplace_back(std::move(dst));
-		return &store.linestring_store->back();
+		store.linestring_store->emplace_back(id, std::move(dst));
 	}
 
-	linestring_t const &retrieve_linestring(generated const &store, std::size_t id) const {
-		return store.linestring_store->at(id);
+	linestring_t const &retrieve_linestring(generated const &store, NodeID id) const {
+		auto iter = std::lower_bound(store.linestring_store->begin(), store.linestring_store->end(), id, [](auto const &e, auto id) { 
+			return e.first < id; 
+		});
+
+		if(iter == store.linestring_store->end() || iter->first != id)
+			throw std::out_of_range("Could not find generated linestring with id " + std::to_string(id));
+
+		return iter->second;
 	}
 
 	template<typename Input>
-	handle_t store_multi_polygon(generated &store, Input const &src)
+	void store_multi_polygon(generated &store, NodeID id, Input const &src)
 	{
 		multi_polygon_t dst;
-		boost::geometry::assign(dst, src);
+		dst.resize(src.size());
+		for(std::size_t i = 0; i < src.size(); ++i) {
+			dst[i].outer().resize(src[i].outer().size());
+			boost::geometry::assign(dst[i].outer(), src[i].outer());
+
+			dst[i].inners().resize(src[i].inners().size());
+			for(std::size_t j = 0; j < src[i].inners().size(); ++j) {
+				dst[i].inners()[j].resize(src[i].inners()[j].size());
+				boost::geometry::assign(dst[i].inners()[j], src[i].inners()[j]);
+			}
+		}
 		
 		std::lock_guard<std::mutex> lock(store.multi_polygon_store_mutex);
-		std::size_t id = store.multi_polygon_store->size();
-		store.multi_polygon_store->emplace_back(std::move(dst));
-		return &store.multi_polygon_store->back();
+		store.multi_polygon_store->emplace_back(id, std::move(dst));
 	}
 
-	multi_polygon_t const &retrieve_multi_polygon(generated const &store, std::size_t id) const {
-		return store.multi_polygon_store->at(id);
+	multi_polygon_t const &retrieve_multi_polygon(generated const &store, NodeID id) const {
+		auto iter = std::lower_bound(store.multi_polygon_store->begin(), store.multi_polygon_store->end(), id, [](auto const &e, auto id) { 
+			return e.first < id; 
+		});
+
+		if(iter == store.multi_polygon_store->end() || iter->first != id)
+			throw std::out_of_range("Could not find generated multi polygon with id " + std::to_string(id));
+
+		return iter->second;
 	}
 
 	void clear() {
@@ -457,6 +541,7 @@ public:
 		compact_nodes.clear();
 		ways.clear();
 		relations.clear();
+		used_ways.clear();
 	} 
 
 	void reportStoreSize(std::ostringstream &str);
