@@ -18,6 +18,7 @@ public:
     static void *allocate(size_type n, const void *hint = 0);
     static void deallocate(void *p, size_type n);
     static void destroy(void *p);
+	static void shutdown();
 };
 
 template<typename T>
@@ -219,16 +220,8 @@ public:
 	// Mark a way as used
 	void insert(WayID wayid) {
 		std::lock_guard<std::mutex> lock(mutex);
-		if (wayid>usedList.size()) usedList.resize(wayid+1);
+		if (wayid>usedList.size()) usedList.resize(wayid+256);
 		usedList[wayid] = true;
-	}
-	
-	void insert_set(std::unordered_set<WayID> ids) {
-		std::lock_guard<std::mutex> lock(mutex);
-		for (WayID wayid : ids) {
-			if (wayid>usedList.size()) usedList.resize(wayid+1);
-			usedList[wayid] = true;
-		}
 	}
 	
 	// See if a way is used
@@ -386,6 +379,7 @@ protected:
 	NodeStore nodes;
 	CompactNodeStore compact_nodes;
 	bool use_compact_nodes = false;
+	bool require_integrity = true;
 
 	WayStore ways;
 	RelationStore relations;
@@ -419,6 +413,10 @@ public:
 	void open(std::string const &osm_store_filename);
 
 	void use_compact_store(bool use = true) { use_compact_nodes = use; }
+	void enforce_integrity(bool ei  = true) { require_integrity = ei; }
+
+	void shapes_sort(unsigned int threadNum = 1);
+	void generated_sort(unsigned int threadNum = 1);
 
 	void shapes_sort(unsigned int threadNum = 1);
 	void generated_sort(unsigned int threadNum = 1);
@@ -455,7 +453,6 @@ public:
 	void relations_sort(unsigned int threadNum);
 
 	void mark_way_used(WayID i) { used_ways.insert(i); }
-	void mark_ways_used(std::unordered_set<WayID> ids) { used_ways.insert_set(ids); }
 	bool way_is_used(WayID i) { return used_ways.at(i); }
 	void ensure_used_ways_inited() {
 		if (!used_ways.inited) used_ways.reserve(use_compact_nodes, nodes_size());
@@ -585,8 +582,12 @@ private:
 	template<class PointRange, class NodeIt>
 	void fillPoints(PointRange &points, NodeIt begin, NodeIt end) const {
 		for (auto it = begin; it != end; ++it) {
-			LatpLon ll = nodes_at(*it);
-			boost::geometry::range::push_back(points, boost::geometry::make<Point>(ll.lon/10000000.0, ll.latp/10000000.0));
+			try {
+				LatpLon ll = nodes_at(*it);
+				boost::geometry::range::push_back(points, boost::geometry::make<Point>(ll.lon/10000000.0, ll.latp/10000000.0));
+			} catch (std::out_of_range &err) {
+				if (require_integrity) throw err;
+			}
 		}
 	}
 };
