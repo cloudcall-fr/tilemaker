@@ -418,9 +418,6 @@ public:
 	void shapes_sort(unsigned int threadNum = 1);
 	void generated_sort(unsigned int threadNum = 1);
 
-	void shapes_sort(unsigned int threadNum = 1);
-	void generated_sort(unsigned int threadNum = 1);
-
 	void nodes_insert_back(NodeID i, LatpLon coord) {
 		if(!use_compact_nodes)
 			nodes.insert_back(i, coord);
