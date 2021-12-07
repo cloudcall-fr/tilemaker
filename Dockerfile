@@ -1,5 +1,5 @@
 FROM debian:bullseye-slim
-LABEL Description="Tilemaker" Version="1.4.0"
+LABEL Description="Tilemaker" Version="2.0.0"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
